@@ -108,10 +108,12 @@ def test_sweep_stale_jobs_after_restart(temp_data):
     database.create_job("dead-job", "dead.zip")
     database.reserve_mappings("dead-job", _requested(),
                               identifiers.generate_anonymized)
-    removed = database.sweep_stale_jobs()
-    assert removed == 5
+    (config.JOBS_DIR / "dead-job").mkdir(parents=True, exist_ok=True)
+    result = database.sweep_stale_jobs()
+    assert result == {"jobs": 1, "mappings": 5, "staging_dirs": 1}
     assert database.mapping_stats()["uncommitted_reservations"] == 0
     assert database.get_job("dead-job")["status"] == "failed"
+    assert not (config.JOBS_DIR / "dead-job").exists()
 
 
 def test_full_pipeline_and_anonymization(temp_data):

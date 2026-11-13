@@ -23,13 +23,23 @@ Concurrency model (two API processes share one database file)
 """
 from __future__ import annotations
 
+import logging
+import shutil
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
 from . import config
+
+logger = logging.getLogger(__name__)
+
+
+class DatabaseBusy(sqlite3.OperationalError):
+    """Raised when the SQLite write lock cannot be acquired within the busy
+    timeout.  Mapped to a retryable 503 for unaccepted uploads."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS id_mappings (
@@ -63,7 +73,12 @@ def _utcnow() -> str:
 
 
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
-    """Open a connection with WAL + foreign keys and safe concurrency settings."""
+    """Open a connection with WAL + foreign keys and safe concurrency settings.
+
+    Note: the caller owns the connection lifetime.  Prefer the
+    :func:`connection` context manager, which always closes it — a worker slot
+    may only be released once the connection is actually closed.
+    """
     path = db_path or config.DB_PATH
     conn = sqlite3.connect(
         str(path),
@@ -78,14 +93,47 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def connection(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
+    """Open a connection and guarantee it is closed (and its lock released) on
+    every path, including exceptions and busy timeouts."""
+    conn = connect(db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+_BUSY_MARKERS = ("database is locked", "database table is locked")
+
+
+def is_busy_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a SQLite lock/busy timeout rather than a logic
+    error — such failures are retryable."""
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        marker in str(exc) for marker in _BUSY_MARKERS
+    )
+
+
+def raise_if_busy(exc: Exception) -> None:
+    """Re-raise lock-timeout errors as :class:`DatabaseBusy`."""
+    if is_busy_error(exc):
+        raise DatabaseBusy(str(exc)) from exc
+
+
 def init_db() -> None:
-    with connect() as conn:
+    with connection() as conn:
         conn.executescript(SCHEMA)
 
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        # Acquire failure: no transaction is open, nothing to roll back.
+        raise_if_busy(exc)
+        raise
     try:
         yield conn
         conn.execute("COMMIT")
@@ -97,13 +145,22 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
 # --------------------------------------------------------------------------- jobs
 
 def create_job(job_id: str, original_name: str) -> None:
+    """Insert the processing job row synchronously.
+
+    A lock timeout propagates as :class:`DatabaseBusy` so the upload layer
+    can answer with a retryable 503 instead of swallowing it.
+    """
     now = _utcnow()
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO jobs (id, status, original_name, created_at, updated_at) "
-            "VALUES (?, 'processing', ?, ?, ?)",
-            (job_id, original_name, now, now),
-        )
+    try:
+        with connection() as conn:
+            conn.execute(
+                "INSERT INTO jobs (id, status, original_name, created_at, updated_at) "
+                "VALUES (?, 'processing', ?, ?, ?)",
+                (job_id, original_name, now, now),
+            )
+    except sqlite3.OperationalError as exc:
+        raise_if_busy(exc)
+        raise
 
 
 def update_job(job_id: str, **fields: str) -> None:
@@ -112,33 +169,35 @@ def update_job(job_id: str, **fields: str) -> None:
     fields["updated_at"] = _utcnow()
     assignments = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [job_id]
-    with connect() as conn:
+    with connection() as conn:
         conn.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", values)
 
 
 def get_job(job_id: str) -> dict | None:
-    with connect() as conn:
+    with connection() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return dict(row) if row else None
 
 
 def list_jobs(limit: int = 100) -> list[dict]:
-    with connect() as conn:
+    with connection() as conn:
         rows = conn.execute(
             "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def sweep_stale_jobs() -> int:
-    """Reclaim mappings of jobs that never finished (process restart/crash).
+def sweep_stale_jobs() -> dict[str, int]:
+    """Reclaim work of jobs that never finished (process restart/crash).
 
-    Processing jobs that no longer exist as a live task are treated as dead.
-    Their uncommitted rows are deleted; committed rows are never owned by a
-    job and are therefore untouched.
+    Processing jobs that no longer exist as a live task are treated as dead:
+    their uncommitted rows are deleted, the job is marked failed, and its
+    private staging directory is removed.  Committed rows are never owned by a
+    job and are therefore untouched.  This also handles jobs that were
+    registered but whose worker never got to run them.
     """
     removed = 0
-    with connect() as conn:
+    with connection() as conn:
         stale = [
             r["id"]
             for r in conn.execute(
@@ -157,7 +216,14 @@ def sweep_stale_jobs() -> int:
                     "WHERE id = ? AND status = 'processing'",
                     ("interrupted by service restart", _utcnow(), job_id),
                 )
-    return removed
+    # Each stale job owns an exclusive staging directory under JOBS_DIR.
+    cleaned_dirs = 0
+    for job_id in stale:
+        job_dir = config.JOBS_DIR / job_id
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+            cleaned_dirs += 1
+    return {"jobs": len(stale), "mappings": removed, "staging_dirs": cleaned_dirs}
 
 
 # ------------------------------------------------------------------- reservations
@@ -181,7 +247,7 @@ def reserve_mappings(
     """
     now = _utcnow()
     result: dict[str, dict[str, str]] = {t: {} for t in requested}
-    with connect() as conn:
+    with connection() as conn:
         with transaction(conn):
             for id_type, values in requested.items():
                 for original in sorted(values):
@@ -215,7 +281,7 @@ def reserve_mappings(
 
 def commit_job(job_id: str) -> int:
     """Mark all rows owned by the job as committed and unowned."""
-    with connect() as conn:
+    with connection() as conn:
         with transaction(conn):
             cur = conn.execute(
                 "UPDATE id_mappings SET committed = 1, owner_job = NULL "
@@ -227,7 +293,7 @@ def commit_job(job_id: str) -> int:
 
 def fail_job(job_id: str, error: str) -> None:
     """Roll back: delete rows still owned by this job, then mark it failed."""
-    with connect() as conn:
+    with connection() as conn:
         with transaction(conn):
             conn.execute(
                 "DELETE FROM id_mappings WHERE owner_job = ? AND committed = 0",
@@ -240,10 +306,44 @@ def fail_job(job_id: str, error: str) -> None:
             )
 
 
+def record_failure(job_id: str, error: str) -> bool:
+    """Best-effort failure bookkeeping with a bounded number of lock retries.
+
+    Returns ``True`` when the rollback was persisted.  On permanent failure the
+    job is left for :func:`sweep_stale_jobs` at the next startup, so no
+    uncommitted mapping or processing row can leak forever.  The connection is
+    closed (releasing any wait slot) after every attempt.
+    """
+    message = (error or "unknown error")[:2000]
+    last_exc: Exception | None = None
+    for attempt in range(max(1, config.FAIL_JOB_RETRIES)):
+        try:
+            fail_job(job_id, message)
+            return True
+        except Exception as exc:  # noqa: BLE001 - retry any transient DB error
+            last_exc = exc
+            logger.warning(
+                "fail_job(%s) attempt %d/%d failed: %s",
+                job_id,
+                attempt + 1,
+                config.FAIL_JOB_RETRIES,
+                exc,
+            )
+            time.sleep(1.0)
+    logger.error(
+        "could not record failure for job %s after %d attempts (%s); "
+        "startup sweep will reclaim it",
+        job_id,
+        config.FAIL_JOB_RETRIES,
+        last_exc,
+    )
+    return False
+
+
 # ---------------------------------------------------------------------- queries
 
 def mapping_stats() -> dict[str, int]:
-    with connect() as conn:
+    with connection() as conn:
         rows = conn.execute(
             "SELECT id_type, committed, COUNT(*) AS n FROM id_mappings "
             "GROUP BY id_type, committed"
@@ -273,5 +373,5 @@ def get_committed_mappings(id_type: str | None = None) -> list[dict]:
         sql += " AND id_type = ?"
         params = (id_type,)
     sql += " ORDER BY id_type, id"
-    with connect() as conn:
+    with connection() as conn:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]

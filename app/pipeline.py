@@ -13,11 +13,14 @@ package never leaves new mappings behind.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import zipfile
 from pathlib import Path
 
 from . import config, database, identifiers
+
+logger = logging.getLogger(__name__)
 
 
 class PackageError(ValueError):
@@ -62,7 +65,8 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> list[Path]:
 # ------------------------------------------------------------------- job pipeline
 
 def process_job(job_id: str, zip_path: Path, original_name: str) -> None:
-    """Run the full pipeline.  Called as a FastAPI background task."""
+    """Run the full pipeline.  Invoked by the dedicated upload worker pool
+    (:mod:`app.runner`); the job row is registered before this is called."""
     job_dir = config.JOBS_DIR / job_id
     extract_dir = job_dir / "input"
     output_dir = job_dir / "output"
@@ -171,17 +175,26 @@ def process_job(job_id: str, zip_path: Path, original_name: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - report any failure, roll back
         message = str(exc) or exc.__class__.__name__
-        try:
-            database.fail_job(job_id, message)
-        except Exception:  # noqa: BLE001
-            # Job row may be missing if failure preceded create_job; ensure it
-            # exists so the client can query the failure reason.
-            database.create_job(job_id, original_name)
-            database.fail_job(job_id, message)
+        # Roll back the job's exclusively-owned uncommitted mappings and mark
+        # it failed.  Retry the bookkeeping when the write lock is contested;
+        # if even that fails, the startup sweep reclaims the residue.
+        if not database.record_failure(job_id, message):
+            logger.error(
+                "failure for job %s could not be persisted immediately: %s",
+                job_id,
+                message,
+            )
+        # Never leave a partial package or any exclusively-owned staging data
+        # behind: the whole per-job directory (spool, extracted files, partial
+        # output) is removed.  The failed job row itself is kept for queries.
         if result_zip.exists():
             result_zip.unlink()
+        shutil.rmtree(output_dir, ignore_errors=True)
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        shutil.rmtree(job_dir, ignore_errors=True)
     finally:
         # Extracted working copy is no longer needed once processing finished.
-        # The source ZIP itself is owned by the caller (the API removes its
-        # uploaded temporary file after the background task completes).
+        # The source ZIP itself is owned by the caller (the runner removes its
+        # uploaded spool file after this function returns).  On the success
+        # path only extract_dir still exists; failure paths already removed it.
         shutil.rmtree(extract_dir, ignore_errors=True)

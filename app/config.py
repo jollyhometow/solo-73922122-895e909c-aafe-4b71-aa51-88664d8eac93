@@ -52,5 +52,27 @@ UID_ORG_ROOT = os.environ.get("UID_ORG_ROOT", "2.25")
 PATIENT_ID_PREFIX = os.environ.get("PATIENT_ID_PREFIX", "ANON")
 
 # SQLite busy timeout: the other replica may briefly hold the write lock
-# during the short reservation/commit transactions.
+# during the short reservation/commit transactions.  Uploads keep waiting for
+# exactly this long (default 30 s); on timeout the unaccepted upload gets a
+# retryable 503 instead of blocking the replica indefinitely.
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("SQLITE_BUSY_TIMEOUT_MS", "30000"))
+
+# Bounded upload admission (per replica).  Upload registration and the whole
+# processing pipeline run on a *dedicated* worker-thread pool of this size;
+# the shared anyio/Starlette thread pool is never enlarged.  At most
+# UPLOAD_QUEUE_LIMIT uploads may additionally wait in the in-memory queue, so
+# the resources consumed by lock-waiting uploads are always bounded; anything
+# beyond that receives an immediate retryable 503.
+UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "8"))
+UPLOAD_QUEUE_LIMIT = int(os.environ.get("UPLOAD_QUEUE_LIMIT", "64"))
+
+# Upper bound an HTTP request spends waiting for its job row to be registered.
+# Must stay above SQLITE_BUSY_TIMEOUT_MS so the busy-timeout 503 (not this
+# generic watchdog) is what clients observe under lock contention.
+REGISTRATION_TIMEOUT_S = float(
+    os.environ.get("REGISTRATION_TIMEOUT_S", str(SQLITE_BUSY_TIMEOUT_MS / 1000.0 + 5))
+)
+
+# How many times failure bookkeeping (rollback + job='failed') retries when
+# the write lock is contested, before leaving it to the startup sweep.
+FAIL_JOB_RETRIES = int(os.environ.get("FAIL_JOB_RETRIES", "3"))

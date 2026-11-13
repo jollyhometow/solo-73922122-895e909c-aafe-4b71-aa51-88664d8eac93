@@ -5,6 +5,8 @@ services:
     environment:
       REPLICA_ID: api1
       DICOM_DATA_DIR: /data
+      # Production default: keep the required 30 s SQLite busy wait.
+      SQLITE_BUSY_TIMEOUT_MS: "30000"
     volumes:
       - dicom-data:/data
     ports:
@@ -19,6 +21,7 @@ services:
     environment:
       REPLICA_ID: api2
       DICOM_DATA_DIR: /data
+      SQLITE_BUSY_TIMEOUT_MS: "30000"
     volumes:
       - dicom-data:/data
     ports:
@@ -48,6 +51,40 @@ services:
     volumes:
       - dicom-data:/data
     entrypoint: ["python", "scripts/demo.py", "--base-url", "http://nginx:8080"]
+
+  # Lock-contention demo: 40 waiting uploads per replica, reads stay < 1 s,
+  # busy timeouts return retryable 503 with no residue.  Uses a short busy
+  # timeout so the demo runs quickly; production keeps the 30 s default.
+  # Run with: docker compose run --rm demo-locking
+  demo-locking:
+    image: dicom-deid:latest
+    depends_on:
+      - nginx
+    profiles: ["demo"]
+    environment:
+      DICOM_DATA_DIR: /data
+    volumes:
+      - dicom-data:/data
+    entrypoint: ["python", "scripts/demo_locking.py",
+                 "--db", "/data/mappings.db",
+                 "--bases", "http://nginx:8080,http://nginx:8080",
+                 "--busy-ms", "3000"]
+
+  # Cancellation demo: starts its own temporary replica with a small bounded
+  # queue and the registration gate, exercises queued cancellation and
+  # post-acceptance disconnect, then tears the replica down.
+  # Run with: docker compose run --rm demo-cancel
+  demo-cancel:
+    image: dicom-deid:latest
+    depends_on:
+      - api1
+    profiles: ["demo"]
+    environment:
+      DICOM_DATA_DIR: /data
+      PYTHONPATH: /app
+    volumes:
+      - dicom-data:/data
+    entrypoint: ["/app/scripts/run_cancel_demo.sh"]
 
 volumes:
   dicom-data:
